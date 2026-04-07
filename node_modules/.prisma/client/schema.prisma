@@ -1,0 +1,275 @@
+// =============================================================================
+// schema.prisma — Finance Dashboard
+// Database : PostgreSQL
+// ORM      : Prisma 5.x
+//
+// Models
+//   1. User            — accounts, roles, status
+//   2. RefreshToken    — JWT refresh token store          (optional enhancement)
+//   3. Category        — reusable income / expense labels
+//   4. FinancialRecord — core transaction entries
+//   5. AuditLog        — immutable action trail           (optional enhancement)
+//
+// Optional enhancements covered
+//   ✅ Auth tokens     — RefreshToken model for secure JWT rotation
+//   ✅ Soft delete     — deletedAt / deletedById on FinancialRecord
+//   ✅ Pagination      — createdAt + id indexes on FinancialRecord
+//   ✅ Search          — notes + description fields on FinancialRecord
+//   ✅ Audit log       — AuditLog model with before / after JSON snapshots
+//   ✅ Role-based      — Role enum enforced at middleware layer
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =============================================================================
+// ENUMS
+// =============================================================================
+
+/// Access level assigned to every user account.
+/// VIEWER  — read-only: dashboard + records
+/// ANALYST — read + analytics / insights endpoints
+/// ADMIN   — full access: records CRUD + user management
+enum Role {
+  VIEWER
+  ANALYST
+  ADMIN
+}
+
+/// Direction of a financial entry.
+enum RecordType {
+  INCOME
+  EXPENSE
+}
+
+/// Lifecycle state of a user account.
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+}
+
+/// All trackable actions written to AuditLog.
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  LOGIN
+  LOGOUT
+  ROLE_CHANGE
+  STATUS_CHANGE
+}
+
+// =============================================================================
+// MODEL: User
+//
+// Central account model. Every other model relates back to User.
+// Passwords are always stored as bcrypt hashes — never plain text.
+//
+// Relations owned by User
+//   createdBy    / createdUsers  — self-join: which admin created this account
+//   records                      — FinancialRecord rows this user authored
+//   categories                   — user-scoped Category rows
+//   refreshTokens                — active JWT sessions
+//   auditLogs                    — AuditLog entries where this user is the actor
+// =============================================================================
+
+model User {
+  id       String     @id @default(uuid())
+  email    String     @unique
+  password String // bcrypt hash — salt rounds: 12
+  name     String
+  role     Role       @default(VIEWER)
+  status   UserStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Self-referencing relation — tracks which admin created this account.
+  // createdById is null for the bootstrap admin (created by seed).
+  createdById  String?
+  createdBy    User?   @relation("UserCreatedBy", fields: [createdById], references: [id])
+  createdUsers User[]  @relation("UserCreatedBy")
+
+  // Reverse relations — required by Prisma for every relation defined
+  // on the other side of these models.
+  records       FinancialRecord[] @relation("RecordCreatedBy")
+  categories    Category[]        @relation("CategoryOwner")
+  refreshTokens RefreshToken[]    @relation("UserRefreshTokens")
+  auditLogs     AuditLog[]        @relation("AuditActor")
+
+  @@index([email])
+  @@index([role])
+  @@index([status])
+  @@map("users")
+}
+
+// =============================================================================
+// MODEL: RefreshToken
+// Optional Enhancement — persisted refresh tokens for secure JWT rotation.
+//
+// Flow:
+//   Login  → create a RefreshToken row, return token to client
+//   Refresh → look up token, issue new access token, rotate refresh token
+//   Logout  → delete this row (token is now invalid)
+//
+// Cascade delete ensures tokens are removed when a user is deleted.
+// =============================================================================
+
+model RefreshToken {
+  id    String @id @default(uuid())
+  token String @unique // hashed token value stored — raw value sent to client
+
+  userId String
+  user   User   @relation("UserRefreshTokens", fields: [userId], references: [id], onDelete: Cascade)
+
+  // Session metadata — useful for a "manage active sessions" UI
+  userAgent String?
+  ipAddress String?
+
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([token])
+  @@map("refresh_tokens")
+}
+
+// =============================================================================
+// MODEL: Category
+// Named labels attached to FinancialRecord entries.
+//
+// Two kinds of category:
+//   System (userId = null, isSystem = true)
+//     — created by seed, visible to all users, cannot be deleted via API
+//   User-scoped (userId = <user id>, isSystem = false)
+//     — created by an ADMIN for personal grouping
+//
+// The @@unique([name, userId]) constraint means:
+//   — "Salary" can exist once as a system category  (userId = null)
+//   — "Salary" can also exist once per user         (userId = <id>)
+// =============================================================================
+
+model Category {
+  id          String  @id @default(uuid())
+  name        String
+  description String?
+  color       String? // hex color for UI badges e.g. "#22c55e"
+  icon        String? // lucide icon name e.g. "briefcase"
+  isSystem    Boolean @default(false)
+
+  // null  → system / global category (visible to everyone)
+  // <id>  → scoped to a specific user
+  userId String?
+  user   User?   @relation("CategoryOwner", fields: [userId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Reverse relation
+  records FinancialRecord[] @relation("RecordCategory")
+
+  @@unique([name, userId], map: "unique_category_per_user")
+  @@index([userId])
+  @@map("categories")
+}
+
+// =============================================================================
+// MODEL: FinancialRecord
+// Core data model — one row per income or expense transaction.
+//
+// Optional enhancements baked in:
+//   Soft delete  — deletedAt + deletedById; filter with WHERE deletedAt IS NULL
+//   Search       — description + notes are free-text fields, query with ILIKE
+//   Pagination   — ordered by createdAt DESC; cursor via id
+//   Reference    — external receipt / invoice number for traceability
+//
+// amount uses Decimal(12,2) — never Float for financial data (precision loss).
+// date   is the real-world transaction date, not the DB insertion timestamp.
+// =============================================================================
+
+model FinancialRecord {
+  id          String     @id @default(uuid())
+  amount      Decimal    @db.Decimal(12, 2)
+  type        RecordType
+  description String?
+  notes       String?
+  date        DateTime // real-world transaction date
+  reference   String? // receipt / invoice number
+
+  // Category — nullable so records survive category deletion
+  categoryId String?
+  category   Category? @relation("RecordCategory", fields: [categoryId], references: [id], onDelete: SetNull)
+
+  // Author
+  createdById String
+  createdBy   User   @relation("RecordCreatedBy", fields: [createdById], references: [id])
+
+  // Soft delete fields (optional enhancement)
+  // When an ADMIN deletes a record the API sets deletedAt = now()
+  // and deletedById = req.user.id instead of issuing a hard DELETE.
+  // All list / aggregate queries must include: WHERE deletedAt IS NULL
+  deletedAt   DateTime?
+  deletedById String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Indexes tuned for the most common query patterns
+  @@index([type]) // GET /records?type=INCOME
+  @@index([date]) // GET /records?startDate=&endDate=
+  @@index([categoryId]) // GET /dashboard/by-category
+  @@index([createdById]) // GET /records?createdBy=
+  @@index([deletedAt]) // WHERE deletedAt IS NULL — every list query
+  @@index([date, type]) // monthly income vs expense reports
+  @@index([createdAt]) // default sort + cursor pagination
+  @@map("financial_records")
+}
+
+// =============================================================================
+// MODEL: AuditLog
+// Optional Enhancement — append-only action trail.
+//
+// Written for every:
+//   CREATE / UPDATE / DELETE on FinancialRecord
+//   LOGIN  / LOGOUT  on User
+//   ROLE_CHANGE / STATUS_CHANGE on User
+//
+// before / after store JSON snapshots of the row state before and after
+// the mutation. null before → CREATE. null after → DELETE.
+//
+// This table is never hard-deleted. Rows are only ever inserted.
+// =============================================================================
+
+model AuditLog {
+  id       String      @id @default(uuid())
+  action   AuditAction
+  entity   String // model name e.g. "FinancialRecord" | "User"
+  entityId String? // primary key of the affected row
+
+  // The user who triggered this action
+  userId String
+  user   User   @relation("AuditActor", fields: [userId], references: [id])
+
+  // State snapshots
+  before Json? // row state before mutation  (null for CREATE)
+  after  Json? // row state after  mutation  (null for DELETE)
+
+  // Request metadata for traceability
+  ipAddress String?
+  userAgent String?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([entity, entityId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
